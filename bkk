@@ -1,0 +1,328 @@
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#include <vector>
+#include <iostream>
+#include <string>
+#include <cmath>
+
+const int TILE_SIZE = 32;
+const int GRID_W = 60;
+const int GRID_H = 40;
+const int WINDOW_W = 1280;
+const int WINDOW_H = 720;
+
+enum TileType {
+    TILE_FLOOR = 0,
+    TILE_WALL  = 1,
+    TILE_CONVEYOR = 2
+};
+
+enum PlayerState { STATE_IDLE, STATE_WALK, STATE_RUN };
+
+struct Animation {
+    SDL_Texture* texture = nullptr;
+    int frameCount = 0;
+    int frameWidth = 0;
+    int frameHeight = 0;
+    float fps = 8.0f;
+};
+
+struct TileMap {
+    std::vector<int> visual;
+    std::vector<int> collision;
+};
+
+SDL_Texture* loadTexture(SDL_Renderer* renderer, const std::string& path) {
+    SDL_Surface* surf = IMG_Load(path.c_str());
+    if (!surf) {
+        std::cout << "Failed to load: " << path << " -> " << IMG_GetError() << "\n";
+        return nullptr;
+    }
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
+    SDL_FreeSurface(surf);
+    return tex;
+}
+
+Animation loadAnim(SDL_Renderer* renderer, const std::string& path, int frameCount, float fps) {
+    Animation anim;
+    anim.texture = loadTexture(renderer, path);
+    anim.frameCount = frameCount;
+    anim.fps = fps;
+
+    if (anim.texture) {
+        int w, h;
+        SDL_QueryTexture(anim.texture, NULL, NULL, &w, &h);
+        anim.frameWidth = w / frameCount;
+        anim.frameHeight = h;
+        std::cout << "Loaded: " << path << " | sheet=" << w << "x" << h
+                  << " | frames=" << frameCount
+                  << " | frameSize=" << anim.frameWidth << "x" << anim.frameHeight << "\n";
+    }
+    return anim;
+}
+
+int main(int argc, char* argv[]) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        std::cout << "SDL init failed: " << SDL_GetError() << "\n";
+        return 1;
+    }
+    if (!(IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG)) {
+        std::cout << "IMG init failed: " << IMG_GetError() << "\n";
+        return 1;
+    }
+
+    SDL_Window* window = SDL_CreateWindow(
+        "Mini Factorio - Dungeon",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WINDOW_W, WINDOW_H, 0
+    );
+
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    // === NEW BACKGROUND: mainlevbuild.png from assets folder ===
+    std::string bgPath = "assets/mainlevbuild.png";
+    SDL_Texture* background = loadTexture(renderer, bgPath);
+    if (!background) {
+        std::cout << "Warning: Could not load assets/mainlevbuild.png\n";
+    }
+
+    // Player Animations
+    std::string spritePath = "/home/console/pix/knight-sprites/Sprites/without_outline/";
+    Animation animIdle = loadAnim(renderer, spritePath + "IDLE.png", 4, 6.0f);
+    Animation animWalk = loadAnim(renderer, spritePath + "WALK.png", 8, 10.0f);
+    Animation animRun  = loadAnim(renderer, spritePath + "RUN.png",  8, 12.0f);
+
+    // Fix idle frame size
+    if (animIdle.texture) {
+        animIdle.frameWidth = 96;
+        animIdle.frameHeight = 84;
+    }
+
+    // Tile Map
+    TileMap tilemap;
+    tilemap.visual.assign(GRID_W * GRID_H, TILE_FLOOR);
+    tilemap.collision.assign(GRID_W * GRID_H, 0);
+
+    // Build basic dungeon walls
+    for (int x = 0; x < GRID_W; x++) {
+        tilemap.collision[x] = 1;
+        tilemap.collision[(GRID_H-1)*GRID_W + x] = 1;
+        tilemap.visual[x] = TILE_WALL;
+        tilemap.visual[(GRID_H-1)*GRID_W + x] = TILE_WALL;
+    }
+    for (int y = 0; y < GRID_H; y++) {
+        tilemap.collision[y*GRID_W] = 1;
+        tilemap.collision[y*GRID_W + GRID_W-1] = 1;
+        tilemap.visual[y*GRID_W] = TILE_WALL;
+        tilemap.visual[y*GRID_W + GRID_W-1] = TILE_WALL;
+    }
+
+    // Inner walls
+    for (int x = 8; x < 30; x++) {
+        tilemap.collision[10 * GRID_W + x] = 1;
+        tilemap.collision[28 * GRID_W + x] = 1;
+        tilemap.visual[10 * GRID_W + x] = TILE_WALL;
+        tilemap.visual[28 * GRID_W + x] = TILE_WALL;
+    }
+    for (int y = 12; y < 22; y++) {
+        tilemap.collision[y * GRID_W + 15] = 1;
+        tilemap.collision[y * GRID_W + 35] = 1;
+        tilemap.visual[y * GRID_W + 15] = TILE_WALL;
+        tilemap.visual[y * GRID_W + 35] = TILE_WALL;
+    }
+
+    float playerX = 3 * TILE_SIZE;
+    float playerY = 3 * TILE_SIZE;
+    float camX = 0, camY = 0;
+    float zoom = 1.0f;
+
+    const float ZOOM_MIN = 0.3f;
+    const float ZOOM_MAX = 3.0f;
+    const float ZOOM_STEP = 0.1f;
+
+    bool facingLeft = false;
+    PlayerState playerState = STATE_IDLE;
+    float animTime = 0.0f;
+    Uint32 lastTick = SDL_GetTicks();
+    bool running = true;
+
+    while (running) {
+        Uint32 now = SDL_GetTicks();
+        float dt = (now - lastTick) / 1000.0f;
+        lastTick = now;
+
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) running = false;
+
+            if (e.type == SDL_MOUSEWHEEL) {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                float worldMouseX = mx / zoom + camX;
+                float worldMouseY = my / zoom + camY;
+
+                if (e.wheel.y > 0) zoom = std::min(zoom + ZOOM_STEP, ZOOM_MAX);
+                else if (e.wheel.y < 0) zoom = std::max(zoom - ZOOM_STEP, ZOOM_MIN);
+
+                camX = worldMouseX - mx / zoom;
+                camY = worldMouseY - my / zoom;
+            }
+
+            if (e.type == SDL_MOUSEBUTTONDOWN) {
+                float worldX = (e.button.x / zoom + camX) / TILE_SIZE;
+                float worldY = (e.button.y / zoom + camY) / TILE_SIZE;
+                int tx = (int)worldX;
+                int ty = (int)worldY;
+                if (tx >= 0 && tx < GRID_W && ty >= 0 && ty < GRID_H) {
+                    tilemap.visual[ty * GRID_W + tx] = TILE_CONVEYOR;
+                    tilemap.collision[ty * GRID_W + tx] = 0;
+                }
+            }
+        }
+
+        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        bool shift = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
+        bool moving = keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_S] ||
+                      keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_D];
+
+        float speed = shift ? 4.5f : 2.5f;
+        float newX = playerX;
+        float newY = playerY;
+
+        if (keys[SDL_SCANCODE_A]) { newX -= speed; facingLeft = true; }
+        if (keys[SDL_SCANCODE_D]) { newX += speed; facingLeft = false; }
+        if (keys[SDL_SCANCODE_W]) newY -= speed;
+        if (keys[SDL_SCANCODE_S]) newY += speed;
+
+        // Collision
+        auto isSolid = [&](float wx, float wy) -> bool {
+            int tx = (int)(wx / TILE_SIZE);
+            int ty = (int)(wy / TILE_SIZE);
+            if (tx < 0 || tx >= GRID_W || ty < 0 || ty >= GRID_H) return true;
+            return tilemap.collision[ty * GRID_W + tx] == 1;
+        };
+
+        if (!isSolid(newX + 8, playerY + 8) && !isSolid(newX + TILE_SIZE - 8, playerY + 8))
+            playerX = newX;
+
+        if (!isSolid(playerX + 8, newY + 8) && !isSolid(playerX + TILE_SIZE - 8, newY + TILE_SIZE - 8))
+            playerY = newY;
+
+        // Animation state
+        PlayerState newState = STATE_IDLE;
+        if (moving && shift) newState = STATE_RUN;
+        else if (moving) newState = STATE_WALK;
+
+        if (newState != playerState) {
+            playerState = newState;
+            animTime = 0.0f;
+        }
+
+        // Camera
+        camX = playerX - (WINDOW_W / zoom) / 2.0f + TILE_SIZE / 2.0f;
+        camY = playerY - (WINDOW_H / zoom) / 2.0f + TILE_SIZE / 2.0f;
+
+        float maxCamX = GRID_W * TILE_SIZE - WINDOW_W / zoom;
+        float maxCamY = GRID_H * TILE_SIZE - WINDOW_H / zoom;
+        camX = std::max(0.0f, std::min(camX, maxCamX));
+        camY = std::max(0.0f, std::min(camY, maxCamY));
+
+        // Select animation
+        Animation* anim = &animIdle;
+        if (playerState == STATE_WALK && animWalk.texture) anim = &animWalk;
+        if (playerState == STATE_RUN  && animRun.texture)  anim = &animRun;
+
+        animTime += dt;
+        int frame = (int)(animTime * anim->fps) % anim->frameCount;
+
+        // ================= RENDER =================
+        SDL_RenderClear(renderer);
+
+        auto worldToScreen = [&](float wx, float wy, int& sx, int& sy) {
+            sx = (int)((wx - camX) * zoom);
+            sy = (int)((wy - camY) * zoom);
+        };
+
+        int scaledTile = (int)(TILE_SIZE * zoom);
+
+        // Draw new background (mainlevbuild.png)
+        if (background) {
+            int bgW, bgH;
+            SDL_QueryTexture(background, NULL, NULL, &bgW, &bgH);
+            int scaledBgW = (int)(bgW * zoom);
+            int scaledBgH = (int)(bgH * zoom);
+
+            for (int ty = 0; ty < GRID_H * TILE_SIZE; ty += bgH) {
+                for (int tx = 0; tx < GRID_W * TILE_SIZE; tx += bgW) {
+                    int sx, sy;
+                    worldToScreen(tx, ty, sx, sy);
+                    SDL_Rect dst = {sx, sy, scaledBgW, scaledBgH};
+                    SDL_RenderCopy(renderer, background, NULL, &dst);
+                }
+            }
+        } else {
+            SDL_SetRenderDrawColor(renderer, 25, 25, 35, 255);
+            SDL_Rect fallback = {0, 0, WINDOW_W, WINDOW_H};
+            SDL_RenderFillRect(renderer, &fallback);
+        }
+
+        // Draw tile overlays (walls & conveyors)
+        for (int y = 0; y < GRID_H; y++) {
+            for (int x = 0; x < GRID_W; x++) {
+                int sx, sy;
+                worldToScreen(x * TILE_SIZE, y * TILE_SIZE, sx, sy);
+                if (sx + scaledTile < 0 || sx > WINDOW_W || sy + scaledTile < 0 || sy > WINDOW_H) continue;
+
+                SDL_Rect rect = {sx, sy, scaledTile, scaledTile};
+
+                if (tilemap.visual[y * GRID_W + x] == TILE_WALL) {
+                    SDL_SetRenderDrawColor(renderer, 80, 80, 90, 180);
+                    SDL_RenderFillRect(renderer, &rect);
+                }
+                else if (tilemap.visual[y * GRID_W + x] == TILE_CONVEYOR) {
+                    SDL_SetRenderDrawColor(renderer, 200, 140, 30, 220);
+                    SDL_RenderFillRect(renderer, &rect);
+                }
+            }
+        }
+
+        // Draw Player
+        if (anim->texture) {
+            SDL_Rect src = { frame * anim->frameWidth, 0, anim->frameWidth, anim->frameHeight };
+
+            const float spriteScale = 2.0f;
+            int drawW = (int)(anim->frameWidth * spriteScale * zoom);
+            int drawH = (int)(anim->frameHeight * spriteScale * zoom);
+
+            int sx, sy;
+            worldToScreen(playerX, playerY, sx, sy);
+
+            int offsetX = (int)(anim->frameWidth * 0.25f * spriteScale * zoom);
+
+            SDL_Rect dst = {
+                sx - offsetX,
+                sy - drawH / 2 + 6,
+                drawW, drawH
+            };
+
+            SDL_RendererFlip flip = facingLeft ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+            SDL_RenderCopyEx(renderer, anim->texture, &src, &dst, 0, NULL, flip);
+        }
+
+        SDL_RenderPresent(renderer);
+        SDL_Delay(16);
+    }
+
+    // Cleanup
+    if (background) SDL_DestroyTexture(background);
+    if (animIdle.texture) SDL_DestroyTexture(animIdle.texture);
+    if (animWalk.texture) SDL_DestroyTexture(animWalk.texture);
+    if (animRun.texture)  SDL_DestroyTexture(animRun.texture);
+
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    IMG_Quit();
+    SDL_Quit();
+    return 0;
+}

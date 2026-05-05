@@ -1,0 +1,537 @@
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#include <SDL2/SDL_ttf.h>
+#include <vector>
+#include <iostream>
+#include <string>
+#include <cmath>
+#include <map>
+
+const int TILE_SIZE = 32;
+const int GRID_W = 60;
+const int GRID_H = 40;
+const int WINDOW_W = 1280;
+const int WINDOW_H = 720;
+
+enum Tile { EMPTY, CONVEYOR };
+enum PlayerState { STATE_IDLE, STATE_WALK, STATE_RUN, STATE_ATTACK };
+
+// INVENTORY
+struct Item {
+    std::string name;
+    int count = 0;
+};
+
+const int INV_COLS = 10;
+const int INV_ROWS = 5;
+const int SLOT_SIZE = 64;
+const int SLOT_PAD  = 6;
+
+struct Inventory {
+    Item slots[INV_COLS * INV_ROWS];
+    bool open = false;
+
+    Inventory() {
+        // claude: Pre-fill with some items like Factorio
+        slots[0] = {"Iron Plate",     47};
+        slots[1] = {"Copper Plate",   23};
+        slots[2] = {"Coal",          120};
+        slots[3] = {"Stone",          35};
+        slots[4] = {"Wood",           18};
+        slots[5] = {"Iron Gear",      12};
+        slots[6] = {"Copper Cable",   64};
+        slots[7] = {"Green Circuit",   8};
+        slots[8] = {"Iron Chest",      3};
+        slots[9] = {"Conveyor Belt",  50};
+    }
+};
+
+// Animation
+struct Animation {
+    SDL_Texture* texture  = nullptr;
+    int frameCount  = 0;
+    int frameWidth  = 0;
+    int frameHeight = 0;
+    float fps       = 8.0f;
+};
+
+SDL_Texture* loadTexture(SDL_Renderer* renderer, const std::string& path) {
+    SDL_Surface* surf = IMG_Load(path.c_str());
+    if (!surf) {
+        std::cout << "Failed to load: " << path << " -> " << IMG_GetError() << "\n";
+        return nullptr;
+    }
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
+    SDL_FreeSurface(surf);
+    return tex;
+}
+
+Animation loadAnim(SDL_Renderer* renderer, const std::string& path,
+                   int frameCount, float fps) {
+    Animation anim;
+    anim.texture    = loadTexture(renderer, path);
+    anim.frameCount = frameCount;
+    anim.fps        = fps;
+    if (anim.texture) {
+        int w, h;
+        SDL_QueryTexture(anim.texture, NULL, NULL, &w, &h);
+        anim.frameWidth  = w / frameCount;
+        anim.frameHeight = h;
+        std::cout << "Loaded: " << path
+                  << " | sheet=" << w << "x" << h
+                  << " | frames=" << frameCount
+                  << " | frameSize=" << anim.frameWidth << "x" << anim.frameHeight << "\n";
+    }
+    return anim;
+}
+
+// ─── Draw rounded rect helper ────────────────────────────────────────────────
+void drawRoundRect(SDL_Renderer* r, SDL_Rect rect, int radius,
+                   SDL_Color fill, SDL_Color border) {
+    // Fill body
+    SDL_SetRenderDrawColor(r, fill.r, fill.g, fill.b, fill.a);
+    SDL_Rect inner = {rect.x + radius, rect.y, rect.w - 2*radius, rect.h};
+    SDL_RenderFillRect(r, &inner);
+    SDL_Rect left  = {rect.x, rect.y + radius, radius, rect.h - 2*radius};
+    SDL_Rect right = {rect.x + rect.w - radius, rect.y + radius, radius, rect.h - 2*radius};
+    SDL_RenderFillRect(r, &left);
+    SDL_RenderFillRect(r, &right);
+
+    // Corners (filled circles approximated as filled rects for simplicity)
+    SDL_Rect tl = {rect.x, rect.y, radius, radius};
+    SDL_Rect tr = {rect.x + rect.w - radius, rect.y, radius, radius};
+    SDL_Rect bl = {rect.x, rect.y + rect.h - radius, radius, radius};
+    SDL_Rect br = {rect.x + rect.w - radius, rect.y + rect.h - radius, radius, radius};
+    SDL_RenderFillRect(r, &tl);
+    SDL_RenderFillRect(r, &tr);
+    SDL_RenderFillRect(r, &bl);
+    SDL_RenderFillRect(r, &br);
+
+    // Border
+    SDL_SetRenderDrawColor(r, border.r, border.g, border.b, border.a);
+    SDL_RenderDrawRect(r, &rect);
+}
+
+// ─── Render inventory panel ──────────────────────────────────────────────────
+void renderInventory(SDL_Renderer* renderer, TTF_Font* font,
+                     TTF_Font* fontSmall, const Inventory& inv) {
+    if (!inv.open) return;
+
+    int panelW = INV_COLS * (SLOT_SIZE + SLOT_PAD) + SLOT_PAD + 20;
+    int panelH = INV_ROWS * (SLOT_SIZE + SLOT_PAD) + SLOT_PAD + 50;
+    int panelX = (WINDOW_W - panelW) / 2;
+    int panelY = (WINDOW_H - panelH) / 2;
+
+    // Background panel
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 20, 20, 28, 230);
+    SDL_Rect panelRect = {panelX, panelY, panelW, panelH};
+    SDL_RenderFillRect(renderer, &panelRect);
+
+    // Panel border (Factorio dark-orange style)
+    SDL_SetRenderDrawColor(renderer, 200, 130, 40, 255);
+    SDL_RenderDrawRect(renderer, &panelRect);
+
+    // Title bar
+    SDL_SetRenderDrawColor(renderer, 35, 28, 15, 255);
+    SDL_Rect titleBar = {panelX, panelY, panelW, 36};
+    SDL_RenderFillRect(renderer, &titleBar);
+    SDL_SetRenderDrawColor(renderer, 200, 130, 40, 255);
+    SDL_RenderDrawRect(renderer, &titleBar);
+
+    // Title text
+    if (font) {
+        SDL_Color white = {230, 180, 80, 255};
+        SDL_Surface* ts = TTF_RenderText_Blended(font, "Inventory", white);
+        if (ts) {
+            SDL_Texture* tt = SDL_CreateTextureFromSurface(renderer, ts);
+            SDL_Rect tdst = {panelX + 10, panelY + 6, ts->w, ts->h};
+            SDL_RenderCopy(renderer, tt, NULL, &tdst);
+            SDL_DestroyTexture(tt);
+            SDL_FreeSurface(ts);
+        }
+    }
+
+    // Hint text (press E to close)
+    if (fontSmall) {
+        SDL_Color hint = {120, 100, 60, 200};
+        SDL_Surface* hs = TTF_RenderText_Blended(fontSmall, "[E] Close", hint);
+        if (hs) {
+            SDL_Texture* ht = SDL_CreateTextureFromSurface(renderer, hs);
+            SDL_Rect hdst = {panelX + panelW - hs->w - 10, panelY + 10, hs->w, hs->h};
+            SDL_RenderCopy(renderer, ht, NULL, &hdst);
+            SDL_DestroyTexture(ht);
+            SDL_FreeSurface(hs);
+        }
+    }
+
+    // Draw slots
+    for (int row = 0; row < INV_ROWS; row++) {
+        for (int col = 0; col < INV_COLS; col++) {
+            int idx = row * INV_COLS + col;
+            int sx = panelX + 10 + col * (SLOT_SIZE + SLOT_PAD);
+            int sy = panelY + 44 + row * (SLOT_SIZE + SLOT_PAD);
+
+            const Item& item = inv.slots[idx];
+            bool hasItem = item.count > 0 && !item.name.empty();
+
+            // Slot background
+            SDL_SetRenderDrawColor(renderer, hasItem ? 40 : 28, hasItem ? 38 : 28,
+                                   hasItem ? 30 : 22, 255);
+            SDL_Rect slotRect = {sx, sy, SLOT_SIZE, SLOT_SIZE};
+            SDL_RenderFillRect(renderer, &slotRect);
+
+            // Slot border
+            SDL_SetRenderDrawColor(renderer, hasItem ? 130 : 60,
+                                   hasItem ? 100 : 55,
+                                   hasItem ? 40  : 45, 255);
+            SDL_RenderDrawRect(renderer, &slotRect);
+
+            if (hasItem && fontSmall) {
+                // Item name (abbreviated to fit)
+                std::string abbr = item.name;
+                if (abbr.size() > 8) abbr = abbr.substr(0, 7) + ".";
+                SDL_Color nameCol = {200, 180, 120, 255};
+                SDL_Surface* ns = TTF_RenderText_Blended(fontSmall, abbr.c_str(), nameCol);
+                if (ns) {
+                    // Scale to fit slot width
+                    int nw = ns->w, nh = ns->h;
+                    if (nw > SLOT_SIZE - 4) nw = SLOT_SIZE - 4;
+                    SDL_Texture* nt = SDL_CreateTextureFromSurface(renderer, ns);
+                    SDL_Rect ndst = {sx + (SLOT_SIZE - nw) / 2, sy + 6, nw, nh};
+                    SDL_RenderCopy(renderer, nt, NULL, &ndst);
+                    SDL_DestroyTexture(nt);
+                    SDL_FreeSurface(ns);
+                }
+
+                // Item count (bottom-right, bright yellow)
+                std::string cnt = std::to_string(item.count);
+                SDL_Color cntCol = {255, 220, 60, 255};
+                SDL_Surface* cs = TTF_RenderText_Blended(fontSmall, cnt.c_str(), cntCol);
+                if (cs) {
+                    SDL_Texture* ct = SDL_CreateTextureFromSurface(renderer, cs);
+                    SDL_Rect cdst = {sx + SLOT_SIZE - cs->w - 4,
+                                     sy + SLOT_SIZE - cs->h - 4, cs->w, cs->h};
+                    SDL_RenderCopy(renderer, ct, NULL, &cdst);
+                    SDL_DestroyTexture(ct);
+                    SDL_FreeSurface(cs);
+                }
+            }
+        }
+    }
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+int main(int argc, char* argv[]) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        std::cout << "SDL init failed: " << SDL_GetError() << "\n";
+        return 1;
+    }
+    if (!(IMG_Init(IMG_INIT_PNG) & IMG_INIT_PNG)) {
+        std::cout << "IMG init failed: " << IMG_GetError() << "\n";
+        return 1;
+    }
+    if (TTF_Init() != 0) {
+        std::cout << "TTF init failed: " << TTF_GetError() << "\n";
+        // Non-fatal – inventory text just won't render
+    }
+
+    SDL_Window* window = SDL_CreateWindow(
+        "Mini Factorio", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WINDOW_W, WINDOW_H, 0);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    // ── Fonts ──────────────────────────────────────────────────────────────
+    // Try common system font paths; fall back gracefully if missing
+    TTF_Font* font      = nullptr;
+    TTF_Font* fontSmall = nullptr;
+    const char* fontPaths[] = {
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        nullptr
+    };
+    for (int i = 0; fontPaths[i]; i++) {
+        font      = TTF_OpenFont(fontPaths[i], 18);
+        fontSmall = TTF_OpenFont(fontPaths[i], 12);
+        if (font && fontSmall) break;
+        if (font)      { TTF_CloseFont(font);      font      = nullptr; }
+        if (fontSmall) { TTF_CloseFont(fontSmall); fontSmall = nullptr; }
+    }
+
+    // ── Background ─────────────────────────────────────────────────────────
+    std::string basePath = SDL_GetBasePath();
+    SDL_Surface* bgSurface = IMG_Load((basePath + "map.png").c_str());
+    if (!bgSurface) bgSurface = IMG_Load("arch-eagle.png");
+    SDL_Texture* background = nullptr;
+    if (bgSurface) {
+        background = SDL_CreateTextureFromSurface(renderer, bgSurface);
+        SDL_FreeSurface(bgSurface);
+    }
+
+    // ── Sprites ────────────────────────────────────────────────────────────
+    std::string spritePath = "/home/console/pix/knight-sprites/Sprites/without_outline/";
+
+    Animation animIdle   = loadAnim(renderer, spritePath + "IDLE.png",   4,  6.0f);
+    Animation animWalk   = loadAnim(renderer, spritePath + "WALK.png",   8, 10.0f);
+    Animation animRun    = loadAnim(renderer, spritePath + "RUN.png",    8, 12.0f);
+    Animation animAttack = loadAnim(renderer, spritePath + "ATTACK 3.png", 6, 14.0f);
+
+    // Idle frame-size fix (from original)
+    if (animIdle.texture) {
+        animIdle.frameWidth  = 96;
+        animIdle.frameHeight = 84;
+    }
+
+    // ── Game state ─────────────────────────────────────────────────────────
+    std::vector<Tile> grid(GRID_W * GRID_H, EMPTY);
+
+    float playerX = 5 * TILE_SIZE;
+    float playerY = 5 * TILE_SIZE;
+    float camX = 0, camY = 0;
+    float zoom = 1.0f;
+
+    const float ZOOM_MIN  = 0.3f;
+    const float ZOOM_MAX  = 3.0f;
+    const float ZOOM_STEP = 0.1f;
+
+    bool facingLeft  = false;
+    PlayerState playerState = STATE_IDLE;
+    float animTime = 0.0f;
+
+    // Attack state
+    bool attacking     = false;   // currently playing attack anim
+    bool attackQueued  = false;   // Q was pressed while already attacking
+    bool qWasUp        = true;    // edge-detect so one tap = one attack
+
+    Inventory inventory;
+
+    bool eWasUp = true;           // edge-detect for E
+
+    Uint32 lastTick = SDL_GetTicks();
+    bool running = true;
+
+    while (running) {
+        Uint32 now = SDL_GetTicks();
+        float dt = (now - lastTick) / 1000.0f;
+        lastTick = now;
+
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) running = false;
+
+            if (e.type == SDL_MOUSEWHEEL) {
+                int mx, my;
+                SDL_GetMouseState(&mx, &my);
+                float worldMouseX = mx / zoom + camX;
+                float worldMouseY = my / zoom + camY;
+                if (e.wheel.y > 0) zoom = std::min(zoom + ZOOM_STEP, ZOOM_MAX);
+                else if (e.wheel.y < 0) zoom = std::max(zoom - ZOOM_STEP, ZOOM_MIN);
+                camX = worldMouseX - mx / zoom;
+                camY = worldMouseY - my / zoom;
+            }
+
+            // Place conveyor on left-click (only when inventory is closed)
+            if (e.type == SDL_MOUSEBUTTONDOWN && !inventory.open) {
+                float worldX = (e.button.x / zoom + camX) / TILE_SIZE;
+                float worldY = (e.button.y / zoom + camY) / TILE_SIZE;
+                int tx = (int)worldX, ty = (int)worldY;
+                if (tx >= 0 && tx < GRID_W && ty >= 0 && ty < GRID_H)
+                    grid[ty * GRID_W + tx] = CONVEYOR;
+            }
+        }
+
+        const Uint8* keys = SDL_GetKeyboardState(NULL);
+
+        // ── Inventory toggle (E) ────────────────────────────────────────────
+        bool eDown = keys[SDL_SCANCODE_E];
+        if (eDown && eWasUp) {
+            inventory.open = !inventory.open;
+        }
+        eWasUp = !eDown;
+
+        // ── Attack trigger (Q) ─────────────────────────────────────────────
+        bool qDown = keys[SDL_SCANCODE_Q];
+        if (qDown && qWasUp) {
+            if (!attacking) {
+                attacking  = true;
+                animTime   = 0.0f;
+                playerState = STATE_ATTACK;
+            } else {
+                attackQueued = true;   // buffer one follow-up attack
+            }
+        }
+        qWasUp = !qDown;
+
+        // ── Movement (blocked while inventory is open) ──────────────────────
+        bool shift  = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
+        bool moving = false;
+
+        if (!inventory.open && !attacking) {
+            moving = keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_S] ||
+                     keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_D];
+            float speed = shift ? 4.5f : 2.5f;
+            if (keys[SDL_SCANCODE_A]) { playerX -= speed; facingLeft = true;  }
+            if (keys[SDL_SCANCODE_D]) { playerX += speed; facingLeft = false; }
+            if (keys[SDL_SCANCODE_W]) playerY -= speed;
+            if (keys[SDL_SCANCODE_S]) playerY += speed;
+        }
+
+        // Clamp
+        playerX = std::max(0.0f, std::min(playerX, (GRID_W - 1) * TILE_SIZE * 1.0f));
+        playerY = std::max(0.0f, std::min(playerY, (GRID_H - 1) * TILE_SIZE * 1.0f));
+
+        // ── Select animation ────────────────────────────────────────────────
+        Animation* anim = &animIdle;
+
+        if (attacking) {
+            anim = animAttack.texture ? &animAttack : &animIdle;
+
+            animTime += dt;
+            int totalFrames  = anim->frameCount;
+            float animLength = totalFrames / anim->fps;
+
+            if (animTime >= animLength) {
+                // Attack finished
+                if (attackQueued) {
+                    attackQueued = false;
+                    animTime     = 0.0f;               // replay attack
+                } else {
+                    attacking   = false;
+                    animTime    = 0.0f;
+                    playerState = STATE_IDLE;
+                }
+            }
+        } else {
+            // Normal state machine
+            PlayerState newState = STATE_IDLE;
+            if (moving && shift)  newState = STATE_RUN;
+            else if (moving)      newState = STATE_WALK;
+
+            if (newState != playerState) {
+                playerState = newState;
+                animTime    = 0.0f;
+            }
+
+            if (playerState == STATE_WALK && animWalk.texture) anim = &animWalk;
+            if (playerState == STATE_RUN  && animRun.texture)  anim = &animRun;
+
+            animTime += dt;
+        }
+
+        int frame = (int)(animTime * anim->fps) % anim->frameCount;
+
+        // ── Camera ─────────────────────────────────────────────────────────
+        camX = playerX - (WINDOW_W / zoom) / 2.0f + TILE_SIZE / 2.0f;
+        camY = playerY - (WINDOW_H / zoom) / 2.0f + TILE_SIZE / 2.0f;
+        float maxCamX = GRID_W * TILE_SIZE - WINDOW_W / zoom;
+        float maxCamY = GRID_H * TILE_SIZE - WINDOW_H / zoom;
+        camX = std::max(0.0f, std::min(camX, maxCamX));
+        camY = std::max(0.0f, std::min(camY, maxCamY));
+
+        // ── RENDER ─────────────────────────────────────────────────────────
+        SDL_RenderClear(renderer);
+
+        auto worldToScreen = [&](float wx, float wy, int& sx, int& sy) {
+            sx = (int)((wx - camX) * zoom);
+            sy = (int)((wy - camY) * zoom);
+        };
+
+        int scaledTile = (int)(TILE_SIZE * zoom);
+
+        // Background
+        if (background) {
+            int bgW, bgH;
+            SDL_QueryTexture(background, NULL, NULL, &bgW, &bgH);
+            int scaledBgW = (int)(bgW * zoom);
+            int scaledBgH = (int)(bgH * zoom);
+            for (int ty = 0; ty < GRID_H * TILE_SIZE; ty += bgH) {
+                for (int tx = 0; tx < GRID_W * TILE_SIZE; tx += bgW) {
+                    int sx, sy;
+                    worldToScreen(tx, ty, sx, sy);
+                    SDL_Rect dst = {sx, sy, scaledBgW, scaledBgH};
+                    SDL_RenderCopy(renderer, background, NULL, &dst);
+                }
+            }
+        } else {
+            SDL_SetRenderDrawColor(renderer, 34, 85, 34, 255);
+            SDL_Rect fb = {0, 0, WINDOW_W, WINDOW_H};
+            SDL_RenderFillRect(renderer, &fb);
+        }
+
+        // Grid tiles
+        for (int y = 0; y < GRID_H; y++) {
+            for (int x = 0; x < GRID_W; x++) {
+                int sx, sy;
+                worldToScreen(x * TILE_SIZE, y * TILE_SIZE, sx, sy);
+                if (sx + scaledTile < 0 || sx > WINDOW_W ||
+                    sy + scaledTile < 0 || sy > WINDOW_H) continue;
+                SDL_Rect tileRect = {sx, sy, scaledTile, scaledTile};
+                if (grid[y * GRID_W + x] == CONVEYOR) {
+                    SDL_SetRenderDrawColor(renderer, 200, 180, 40, 200);
+                    SDL_RenderFillRect(renderer, &tileRect);
+                }
+                SDL_SetRenderDrawColor(renderer, 0, 0, 0, 40);
+                SDL_RenderDrawRect(renderer, &tileRect);
+            }
+        }
+
+        // Player sprite
+        if (anim->texture) {
+            SDL_Rect src = {frame * anim->frameWidth, 0,
+                            anim->frameWidth, anim->frameHeight};
+            const float spriteScale = 2.0f;
+            int drawW = (int)(anim->frameWidth  * spriteScale * zoom);
+            int drawH = (int)(anim->frameHeight * spriteScale * zoom);
+            int sx, sy;
+            worldToScreen(playerX, playerY, sx, sy);
+            int offsetX = (int)(anim->frameWidth * 0.25f * spriteScale * zoom);
+            SDL_Rect dst = {sx - offsetX, sy - drawH / 2 + 6, drawW, drawH};
+            SDL_RendererFlip flip = facingLeft ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE;
+            SDL_RenderCopyEx(renderer, anim->texture, &src, &dst, 0, NULL, flip);
+        }
+
+        // ── HUD: keybind hints (bottom-left) ───────────────────────────────
+        if (fontSmall) {
+            const char* hints[] = {"[WASD] Move", "[Shift] Run",
+                                   "[Q] Attack",  "[E] Inventory",
+                                   "[LMB] Place Conveyor"};
+            SDL_Color hc = {200, 200, 180, 180};
+            int hy = WINDOW_H - 10;
+            for (int i = 4; i >= 0; i--) {
+                SDL_Surface* hs = TTF_RenderText_Blended(fontSmall, hints[i], hc);
+                if (hs) {
+                    SDL_Texture* ht = SDL_CreateTextureFromSurface(renderer, hs);
+                    SDL_Rect hd = {10, hy - hs->h, hs->w, hs->h};
+                    SDL_RenderCopy(renderer, ht, NULL, &hd);
+                    SDL_DestroyTexture(ht);
+                    SDL_FreeSurface(hs);
+                    hy -= hs->h + 2;
+                }
+            }
+        }
+
+        // ── Inventory panel ────────────────────────────────────────────────
+        renderInventory(renderer, font, fontSmall, inventory);
+
+        SDL_RenderPresent(renderer);
+        SDL_Delay(16);
+    }
+
+    // Cleanup
+    if (background)         SDL_DestroyTexture(background);
+    if (animIdle.texture)   SDL_DestroyTexture(animIdle.texture);
+    if (animWalk.texture)   SDL_DestroyTexture(animWalk.texture);
+    if (animRun.texture)    SDL_DestroyTexture(animRun.texture);
+    if (animAttack.texture) SDL_DestroyTexture(animAttack.texture);
+    if (font)               TTF_CloseFont(font);
+    if (fontSmall)          TTF_CloseFont(fontSmall);
+
+    TTF_Quit();
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    IMG_Quit();
+    SDL_Quit();
+    return 0;
+}
